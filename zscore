@@ -1,0 +1,77 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller
+import plotly.graph_objects as go
+from datetime import datetime
+
+st.set_page_config(page_title="Cointegración Pro", layout="wide")
+st.title("🧠 Cointegración Multi-Par - En Vivo")
+
+PAIRS = [
+    {"name": "EURUSD/GBPUSD", "a": "EURUSD=X", "b": "GBPUSD=X", "lookback": 50, "entry_z": 2.0},
+    {"name": "US500/NAS100", "a": "^GSPC", "b": "^NDX", "lookback": 50, "entry_z": 1.8},
+    {"name": "GOLD/SILVER", "a": "GC=F", "b": "SI=F", "lookback": 50, "entry_z": 2.2},
+    {"name": "BTCUSD/ETHUSD", "a": "BTC-USD", "b": "ETH-USD", "lookback": 50, "entry_z": 2.5},
+]
+
+@st.cache_data(ttl=300)
+def load_data(a, b):
+    try:
+        df_a = yf.download(a, period="60d", interval="1d", progress=False)["Close"]
+        df_b = yf.download(b, period="60d", interval="1d", progress=False)["Close"]
+        df = pd.concat([df_a, df_b], axis=1).dropna()
+        df.columns = [a, b]
+        return df if len(df) >= 30 else pd.DataFrame()
+    except:
+        return pd.DataFrame()
+
+def calc_beta(df, a, b):
+    if len(df) < 2: return 1.0
+    X = sm.add_constant(df[b])
+    return sm.OLS(df[a], X).fit().params[1]
+
+pair = st.selectbox("Par", [p["name"] for p in PAIRS])
+p = next(x for x in PAIRS if x["name"] == pair)
+
+with st.spinner("Cargando..."):
+    df = load_data(p["a"], p["b"])
+if df.empty:
+    st.error("Sin datos")
+    st.stop()
+
+beta = calc_beta(df, p["a"], p["b"])
+df["spread"] = df[p["a"]] - beta * df[p["b"]]
+z = (df["spread"].iloc[-1] - df["spread"].tail(p["lookback"]).mean()) / df["spread"].tail(p["lookback"]).std()
+
+col1, col2 = st.columns(2)
+col1.metric("β", f"{beta:.4f}")
+col2.metric("Z-Score", f"{z:+.2f}")
+
+signal = "NINGUNA"
+if z < -p["entry_z"]: signal = "🟢 LONG"
+elif z > p["entry_z"]: signal = "🔴 SHORT"
+st.markdown(f"### {signal}")
+
+z_series = (df["spread"] - df["spread"].rolling(p["lookback"]).mean()) / df["spread"].rolling(p["lookback"]).std()
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=df.index, y=z_series, name="Z-Score"))
+fig.add_hline(y=p["entry_z"], line_dash="dash", line_color="red")
+fig.add_hline(y=-p["entry_z"], line_dash="dash", line_color="green")
+fig.add_hline(y=0)
+fig.update_layout(title="Z-Score", height=500)
+st.plotly_chart(fig, use_container_width=True)
+
+if st.button("Backtest"):
+    with st.spinner("Calculando..."):
+        back = yf.download([p["a"], p["b"]], period="6mo", interval="1d")["Close"].dropna()
+        back["spread"] = back[p["a"]] - beta * back[p["b"]]
+        back["z"] = (back["spread"] - back["spread"].rolling(p["lookback"]).mean()) / back["spread"].rolling(p["lookback"]).std()
+        trades = sum(1 for i in range(p["lookback"], len(back)-20) if abs(back["z"].iloc[i]) > p["entry_z"])
+        wins = sum(1 for i in range(p["lookback"], len(back)-20) if abs(back["z"].iloc[i]) > p["entry_z"] and 
+                  ((back["z"].iloc[i] < 0 and back["spread"].iloc[i+20] > back["spread"].iloc[i]) or 
+                   (back["z"].iloc[i] > 0 and back["spread"].iloc[i+20] < back["spread"].iloc[i])))
+        wr = wins / trades * 100 if trades else 0
+        st.success(f"Trades: {trades} | Win Rate: {wr:.1f}%")
